@@ -58,8 +58,10 @@ No CUDA errors or OOMs in any arm.
 
 ## Findings
 
-1. DFlash2 is selected for production on this GPU: +2.8% cold coding mean
-   and +34% decode at 32k, at identical prefill and retrieval accuracy.
+1. DFlash2 won the throughput comparison (+2.8% cold coding mean, +34%
+   decode at 32k, identical prefill and retrieval accuracy) and ran in
+   production for one afternoon - then a vision regression forced a
+   rollback to embedded MTP2 + N-gram (see "Vision limitation").
 2. Draft quantization is irrelevant here: Q8_0 scored within noise of Q4_K_M.
    Keep the 1.09 GB Q4_K_M.
 3. Upstream master does not register `ngram-mod` beside a sidecar draft
@@ -69,7 +71,39 @@ No CUDA errors or OOMs in any arm.
 5. Upstream master now covers the full server feature set used here
    (embedded `draft-mtp`, `ngram-mod`, `--cache-type-*-draft`, reasoning
    flags) without any downstream patch, at parity with the patched older
-   tree (51.37 vs 50.31/49.87).
+
+## Vision limitation (production rollback)
+
+On upstream `8b4b3558f`, `llama-server` routes image-embedding ubatches from
+`mtmd` chunks through `common_speculative_process`. The `draft-dflash` impl
+injects them into the sidecar draft KV cache at target positions. In a long
+conversation served with prompt caching, those positions are fragmented by
+drafting noise from earlier turns, and the 256-token-wide placement fails
+the KV slot search:
+
+```
+find_slot: non-consecutive token position <p> after <p> ... 256 new tokens
+decode: failed to find a memory slot for batch of size 256
+process: llama_decode(ctx_dft) failed rc=1 (n_tokens=256, offset=256)
+slot: failed to decode mtmd chunk ... failed to process mtmd chunk
+-> HTTP 500 "failed to process mtmd chunk"
+```
+
+Every retry of the affected request failed the same way. Short or fresh
+image requests succeed; the trigger is a wide image chunk landing over a
+fragmented draft cache (observed at a ~23.7k-token cached prefix). Upstream
+is aware speculative decoding lacks vision support - the `draft-mtp` and
+`draft-eagle3` impls skip embedding batches behind a TODO ("how to make it
+work with vision tokens?") - and only `draft-dflash` attempts them. The
+upstream MTP mode skips image batches cleanly and survived the same
+structure (52,980-token cached prefix, 1024x1024 image injected over stale
+response cells) without errors.
+
+Consequence: if your workload sends images to a long-lived slot, keep
+speculation on `draft-mtp`/n-gram until this is fixed upstream, or restrict
+DFlash2 to text-only endpoints. The A100 Q6_K kernel patches are not
+involved: the failure is KV bookkeeping before any math kernel runs.
+
 
 ## Reproduce
 
