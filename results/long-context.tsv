@@ -1,0 +1,5 @@
+label	prompt_tokens	completion_tokens	prompt_tps	decode_tps	draft_acceptance	mean_draft_len	retrieval_score
+mtp2-ngram-16k	16164	173	1068.48	73.94	0.38525	6.04	3/3
+mtp2-ngram-32k	32084	179	1022.50	52.99	0.61170	2.83	3/3
+dflash2-16k	16164	173	1060.60	74.21	0.34028	8.00	3/3
+dflash2-32k	32084	179	1015.19	71.20	0.45955	4.94	3/3
