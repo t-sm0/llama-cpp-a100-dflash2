@@ -60,8 +60,9 @@ No CUDA errors or OOMs in any arm.
 
 1. DFlash2 won the throughput comparison (+2.8% cold coding mean, +34%
    decode at 32k, identical prefill and retrieval accuracy) and ran in
-   production for one afternoon - then a vision regression forced a
-   rollback to embedded MTP2 + N-gram (see "Vision limitation").
+   production for one afternoon; a vision regression forced a same-day
+   rollback, the fix was ported the same night and validated (see
+   "Vision limitation and its fix"), and production returned to DFlash2.
 2. Draft quantization is irrelevant here: Q8_0 scored within noise of Q4_K_M.
    Keep the 1.09 GB Q4_K_M.
 3. Upstream master does not register `ngram-mod` beside a sidecar draft
@@ -72,7 +73,7 @@ No CUDA errors or OOMs in any arm.
    (embedded `draft-mtp`, `ngram-mod`, `--cache-type-*-draft`, reasoning
    flags) without any downstream patch, at parity with the patched older
 
-## Vision limitation (production rollback)
+## Vision limitation and its fix
 
 On upstream `8b4b3558f`, `llama-server` routes image-embedding ubatches from
 `mtmd` chunks through `common_speculative_process`. The `draft-dflash` impl
@@ -99,10 +100,32 @@ upstream MTP mode skips image batches cleanly and survived the same
 structure (52,980-token cached prefix, 1024x1024 image injected over stale
 response cells) without errors.
 
-Consequence: if your workload sends images to a long-lived slot, keep
-speculation on `draft-mtp`/n-gram until this is fixed upstream, or restrict
-DFlash2 to text-only endpoints. The A100 Q6_K kernel patches are not
-involved: the failure is KV bookkeeping before any math kernel runs.
+**Fix** (ported from [z-lab/llama.cpp-fork#1](https://github.com/z-lab/llama.cpp-fork/pull/1),
+two commits by @dagnarf, adapted to the post-encoder-fusion upstream): skip
+mtmd embedding batches in the dflash `process()` hook entirely, and
+zero-fill the positional holes they leave with zero-feature injections
+when the next token batch arrives. Drafted tokens remain verified by the
+target, so output stays distribution-exact. Carried here as
+`patches/dflash-mtmd-vision.patch` (applies to `8b4b3558f`).
+
+A100 validation of the patched build (27B Q6_K + DFlash2 Q4_K_M sidecar,
+1024x1024 test image ~1.3k vision tokens):
+
+- Fresh small and large image requests: 200, correct visual answers.
+- The exact production failure structure - 52,980-token cached prefix
+  replayed, image injected over stale response cells
+  (`cached_tokens: 52980`): 200, correct answer, zero mtmd/KV errors.
+- Text turn after the image turn and a second image turn in the same
+  growing conversation: 200, coherent. The log shows the zero-fill
+  activating (`draft cache hole for seq 0: [...] - seeding with zero
+  features`) with no fill failures.
+- Text throughput unchanged: six-prompt cold 53.15 tok/s (unpatched
+  DFlash2 reference 52.80-53.17); 32k retrieval decode 80.85 tok/s with
+  prompt-throughput parity and 3/3 retrieval; 16k-exact 94.42, 3/3.
+
+Until an equivalent fix lands upstream, apply the patch (or keep
+speculation on `draft-mtp`/n-gram for image endpoints). The A100 Q6_K
+kernel patches are not involved: the failure is KV bookkeeping before any
 
 
 ## Reproduce

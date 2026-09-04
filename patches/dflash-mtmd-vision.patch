@@ -1,0 +1,82 @@
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1092,14 +1092,19 @@
+             return true;
+         }
+ 
+-        // Target prefill may contain token IDs or multimodal embeddings. Both
+-        // produce the target-layer features used to seed the draft KV cache, so
+-        // skipping the embedding batches leaves a hole in the draft's cache and
+-        // the next injection fails to initialize.
+-        // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
++        // mtmd image-embedding batches carry M-RoPE positions the 1-D draft
++        // cache cannot store: the first ubatch injects rows at bogus draft
++        // positions and a following ubatch fails the KV slot search
++        // (llama_decode rc=1 -> server 500 "failed to process mtmd chunk").
++        // Skip them entirely; the positional hole they leave is zero-filled
++        // when the next token batch arrives (below). Drafted tokens are
++        // always verified by the target, so this only dips post-image
++        // acceptance, never output correctness.
++        // TODO: extract real target features for mtmd chunks after
++        // https://github.com/ggml-org/llama.cpp/pull/24669 is merged
+         const bool has_tokens     = batch_in.token != nullptr;
+         const bool has_embeddings = batch_in.embd  != nullptr;
+-        if (has_tokens == has_embeddings) {
++        if (!has_tokens || has_embeddings) {
+             return true;
+         }
+ 
+@@ -1125,6 +1130,53 @@
+ 
+         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+ 
++        // Seed draft-cache holes (mtmd chunks skipped above, or a target
++        // prompt-prefix reuse the draft cache never saw) with zero
++        // encoder-input features, so the next injection passes the KV
++        // cache's consecutive-position rule. Distribution-exact: drafted
++        // tokens remain verified by the target (ported from the z-lab fix
++        // for the ggml-org/llama.cpp#27342 vision breakage).
++        for (int32_t j = 0; j < n_tokens; ++j) {
++            if (j > 0 && batch_in.seq_id[j][0] == batch_in.seq_id[j - 1][0]) {
++                continue;
++            }
++            GGML_ASSERT(batch_in.n_seq_id[j] == 1);
++            const llama_seq_id seq_id = batch_in.seq_id[j][0];
++            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++            const llama_pos gap_beg = pos_max + 1;
++            const llama_pos gap_end = batch_in.pos[j]; // exclusive
++            if (gap_end <= gap_beg) {
++                continue;
++            }
++            LOG_WRN("%s: draft cache hole for seq %d: [%d, %d) - seeding with zero features "
++                    "(multimodal chunk or reused prompt prefix bypassed process())\n",
++                    __func__, (int) seq_id, (int) gap_beg, (int) gap_end);
++            for (llama_pos off = gap_beg; off < gap_end; off += n_ubatch) {
++                const int32_t n_chunk = std::min<int32_t>(n_ubatch, (int32_t) (gap_end - off));
++                std::memset(batch_inject.embd, 0, (size_t) n_chunk * n_embd_enc * sizeof(float));
++                batch_inject.n_tokens = n_chunk;
++                for (int32_t i = 0; i < n_chunk; ++i) {
++                    const llama_pos p = off + i;
++                    batch_inject.pos[i] = p;
++                    if (is_mrope) {
++                        batch_inject.pos[1 * n_chunk + i] = p;
++                        batch_inject.pos[2 * n_chunk + i] = p;
++                        batch_inject.pos[3 * n_chunk + i] = 0;
++                    }
++                    batch_inject.n_seq_id[i]  = 1;
++                    batch_inject.seq_id[i][0] = seq_id;
++                    batch_inject.logits[i]    = false;
++                }
++                const int32_t rc = llama_decode(ctx_dft, batch_inject);
++                if (rc != 0) {
++                    LOG_ERR("%s: llama_decode(ctx_dft) zero-fill failed rc=%d (n_tokens=%d, pos=%d)\n",
++                            __func__, rc, (int) n_chunk, (int) off);
++                    return false;
++                }
++                llama_synchronize(ctx_dft);
++            }
++        }
++
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             if (i_batch_beg[seq_id] < 0) {
+                 continue;
