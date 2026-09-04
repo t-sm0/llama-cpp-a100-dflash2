@@ -126,7 +126,7 @@ A100 validation of the patched build (27B Q6_K + DFlash2 Q4_K_M sidecar,
 Until an equivalent fix lands upstream, apply the patch (or keep
 speculation on `draft-mtp`/n-gram for image endpoints). The A100 Q6_K
 kernel patches are not involved: the failure is KV bookkeeping before any
-
+math kernel runs.
 
 ## Reproduce
 
